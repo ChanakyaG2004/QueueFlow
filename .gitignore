@@ -1,0 +1,22 @@
+# Environment files
+.env
+.env.*
+!.env.example
+
+# JavaScript dependencies and build output
+node_modules/
+dist/
+build/
+coverage/
+
+# Python environments and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# Editors and operating systems
+.DS_Store
+.idea/
+.vscode/
+
