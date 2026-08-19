@@ -11,5 +11,44 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
 
+  api:
+    build:
+      context: ./apps/api
+    container_name: queueflow-api
+    depends_on:
+      - postgres
+    environment:
+      PORT: 3001
+      DATABASE_URL: postgresql://queueflow:queueflow@postgres:5432/queueflow
+      AWS_REGION: us-east-1
+      SQS_QUEUE_URL: https://sqs.us-east-1.amazonaws.com/819379976838/queueflow-jobs
+      S3_RESULTS_BUCKET: queueflow-results-819379976838-us-east-1
+      AWS_SHARED_CREDENTIALS_FILE: /root/.aws/credentials
+      AWS_CONFIG_FILE: /root/.aws/config
+    volumes:
+      - ${HOME}/.aws:/root/.aws:ro
+    ports:
+      - "3001:3001"
+
+  worker:
+    build:
+      context: ./workers/processor
+    container_name: queueflow-worker
+    depends_on:
+      - postgres
+    environment:
+      DATABASE_URL: postgresql://queueflow:queueflow@postgres:5432/queueflow
+      AWS_REGION: us-east-1
+      SQS_QUEUE_URL: https://sqs.us-east-1.amazonaws.com/819379976838/queueflow-jobs
+      S3_RESULTS_BUCKET: queueflow-results-819379976838-us-east-1
+      WORKER_NAME: docker-worker
+      WORKER_CPU_CAPACITY: 4
+      WORKER_MEMORY_MB: 8192
+      WORKER_GPU_CAPACITY: 0
+      AWS_SHARED_CREDENTIALS_FILE: /root/.aws/credentials
+      AWS_CONFIG_FILE: /root/.aws/config
+    volumes:
+      - ${HOME}/.aws:/root/.aws:ro
+
 volumes:
   postgres_data:
