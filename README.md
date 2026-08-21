@@ -6,6 +6,8 @@ It uses a **TypeScript/Express control plane**, **Python workers**, **PostgreSQL
 
 QueueFlow includes job lifecycle tracking, retries, dead-letter queue handling, worker registration and heartbeats, resource-aware worker admission, API-key authentication, tenant quotas, S3-backed results, a Python SDK, and CI with GitHub Actions.
 
+It also includes a responsive web dashboard for demoing job submission, live progress, execution events, results, worker capacity, and system health. The dashboard opens in sample-data mode, so it is immediately presentable without the infrastructure running, and can be switched to the live API from its workspace menu.
+
 ---
 
 ## Architecture
@@ -732,6 +734,20 @@ This endpoint exposes registered workers and their health/capacity information.
 
 # Running QueueFlow Locally
 
+## Web dashboard
+
+For the quickest demo, run the dashboard by itself. It starts with interactive sample data and does not require PostgreSQL, AWS, or a worker:
+
+```bash
+cd apps/web
+npm install
+npm run dev
+```
+
+Open `http://localhost:4173`. Use the **Demo mode** control to connect the dashboard to a live QueueFlow API when the backend is available. The default local proxy points to `http://localhost:3001` and uses the documented `queueflow-demo-key` API key.
+
+The dashboard is also included in Docker Compose at `http://localhost:4173`; its `/api` requests are proxied to the API container.
+
 ## Prerequisites
 
 Install:
@@ -990,7 +1006,7 @@ These are potential areas for future development.
 
 Planned improvements include:
 
-- [ ] Web dashboard for jobs, workers, events, and system health
+- [x] Web dashboard for jobs, workers, events, and system health
 - [ ] Live job progress visualization
 - [ ] Worker capacity dashboard
 - [ ] Retry and failure inspection UI

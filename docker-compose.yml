@@ -30,6 +30,15 @@ services:
     ports:
       - "3001:3001"
 
+  web:
+    build:
+      context: ./apps/web
+    container_name: queueflow-web
+    depends_on:
+      - api
+    ports:
+      - "4173:80"
+
   worker:
     build:
       context: ./workers/processor
