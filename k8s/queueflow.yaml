@@ -1,23 +1,7 @@
 apiVersion: v1
-kind: ConfigMap
+kind: ServiceAccount
 metadata:
-  name: queueflow-config
-data:
-  AWS_REGION: us-east-1
-  SQS_QUEUE_URL: https://sqs.us-east-1.amazonaws.com/819379976838/queueflow-jobs
-  S3_RESULTS_BUCKET: queueflow-results-819379976838-us-east-1
-  WORKER_CPU_CAPACITY: "4"
-  WORKER_MEMORY_MB: "8192"
-  WORKER_GPU_CAPACITY: "0"
-
----
-apiVersion: v1
-kind: Secret
-metadata:
-  name: queueflow-secrets
-type: Opaque
-stringData:
-  DATABASE_URL: postgresql://queueflow:queueflow@host.docker.internal:5433/queueflow
+  name: queueflow
 
 ---
 apiVersion: apps/v1
@@ -34,37 +18,25 @@ spec:
       labels:
         app: queueflow-api
     spec:
+      serviceAccountName: queueflow
+      terminationGracePeriodSeconds: 60
       containers:
         - name: api
           image: queueflow-api:local
-          imagePullPolicy: Never
+          imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 3001
-
           envFrom:
             - configMapRef:
                 name: queueflow-config
             - secretRef:
                 name: queueflow-secrets
-
-          env:
-            - name: AWS_SHARED_CREDENTIALS_FILE
-              value: /root/.aws/credentials
-            - name: AWS_CONFIG_FILE
-              value: /root/.aws/config
-
-          volumeMounts:
-            - name: aws-credentials
-              mountPath: /root/.aws
-              readOnly: true
-
           readinessProbe:
             httpGet:
               path: /health
               port: 3001
             initialDelaySeconds: 3
             periodSeconds: 5
-
           resources:
             requests:
               cpu: "100m"
@@ -72,12 +44,6 @@ spec:
             limits:
               cpu: "500m"
               memory: "512Mi"
-
-      volumes:
-        - name: aws-credentials
-          hostPath:
-            path: /Users/chanakyag/.aws
-            type: Directory
 
 ---
 apiVersion: v1
@@ -107,34 +73,22 @@ spec:
       labels:
         app: queueflow-worker
     spec:
+      serviceAccountName: queueflow
+      terminationGracePeriodSeconds: 60
       containers:
         - name: worker
           image: queueflow-worker:local
-          imagePullPolicy: Never
-
+          imagePullPolicy: IfNotPresent
           envFrom:
             - configMapRef:
                 name: queueflow-config
             - secretRef:
                 name: queueflow-secrets
-
           env:
             - name: WORKER_NAME
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
-
-            - name: AWS_SHARED_CREDENTIALS_FILE
-              value: /root/.aws/credentials
-
-            - name: AWS_CONFIG_FILE
-              value: /root/.aws/config
-
-          volumeMounts:
-            - name: aws-credentials
-              mountPath: /root/.aws
-              readOnly: true
-
           resources:
             requests:
               cpu: "250m"
@@ -142,9 +96,3 @@ spec:
             limits:
               cpu: "1"
               memory: "1Gi"
-
-      volumes:
-        - name: aws-credentials
-          hostPath:
-            path: /Users/chanakyag/.aws
-            type: Directory

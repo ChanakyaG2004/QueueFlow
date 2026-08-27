@@ -7,7 +7,15 @@ const sqsClient = new SQSClient({
   region: process.env.AWS_REGION || "us-east-1",
 });
 
-export async function sendJobToQueue(jobId: string, type: string, text?:string) {
+export type JobMessage = {
+  jobId: string;
+  type: string;
+  text?: string;
+};
+
+export type QueueSender = (message: JobMessage) => Promise<void>;
+
+export async function sendJobToQueue(message: JobMessage) {
   const queueUrl = process.env.SQS_QUEUE_URL;
 
   if (!queueUrl) {
@@ -16,11 +24,7 @@ export async function sendJobToQueue(jobId: string, type: string, text?:string) 
 
   const command = new SendMessageCommand({
     QueueUrl: queueUrl,
-    MessageBody: JSON.stringify({
-      jobId,
-      type,
-      text,
-    }),
+    MessageBody: JSON.stringify(message),
   });
 
   await sqsClient.send(command);

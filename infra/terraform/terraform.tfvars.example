@@ -1,0 +1,3 @@
+aws_region         = "us-east-1"
+name_prefix        = "queueflow"
+results_bucket_name = "replace-with-a-globally-unique-queueflow-results-name"
