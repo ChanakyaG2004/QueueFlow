@@ -1,656 +1,213 @@
 # QueueFlow
 
-QueueFlow is a distributed job execution platform for submitting, processing, tracking, and storing asynchronous workloads across independent workers.
+QueueFlow is a portfolio-scale distributed job execution platform. It accepts asynchronous work through a TypeScript/Express API, stores authoritative state in PostgreSQL, delivers execution messages through AWS SQS, runs work on independent Python workers, and stores results in Amazon S3.
 
-It uses a **TypeScript/Express control plane**, **Python workers**, **PostgreSQL**, **AWS SQS**, **Amazon S3**, **Docker**, **Kubernetes**, and **Terraform**.
+The project demonstrates durable state, tenant isolation, quotas, transactional messaging, at-least-once delivery, idempotent job claiming, retries, dead-letter handling, worker leases and recovery, lightweight resource admission, and priority-aware dispatch.
 
-QueueFlow includes job lifecycle tracking, retries, dead-letter queue handling, worker registration and heartbeats, resource-aware worker admission, API-key authentication, tenant quotas, S3-backed results, a Python SDK, and CI with GitHub Actions.
-
----
+QueueFlow is intentionally not a production HPC scheduler and does not execute real GPU workloads.
 
 ## Architecture
 
 ```text
-                       ┌──────────────────────┐
-                       │      Client          │
-                       │ REST API / Python SDK│
-                       └──────────┬───────────┘
-                                  │
-                                  │ HTTP
-                                  ▼
-                       ┌──────────────────────┐
-                       │    QueueFlow API     │
-                       │ TypeScript + Express │
-                       └───────┬──────┬───────┘
-                               │      │
-                    Job State  │      │ Job Message
-                               │      │
-                               ▼      ▼
-                     ┌────────────┐  ┌──────────────┐
-                     │ PostgreSQL │  │   AWS SQS    │
-                     └────────────┘  └──────┬───────┘
-                                            │
-                                            │ Poll
-                                            ▼
-                                  ┌────────────────────┐
-                                  │   Python Workers   │
-                                  │                    │
-                                  │ Worker 1           │
-                                  │ Worker 2           │
-                                  │ ...                │
-                                  └─────────┬──────────┘
-                                            │
-                                            │ Result
-                                            ▼
-                                      ┌──────────┐
-                                      │  AWS S3  │
-                                      └──────────┘
+Client / Python SDK
+        |
+        v
+TypeScript / Express API
+        |
+        | one PostgreSQL transaction
+        v
+PostgreSQL: job + SUBMITTED event + outbox row
+        |
+        | capability- and priority-aware outbox publisher
+        v
+AWS SQS standard queue ---> dead-letter queue after 3 receives
+        |
+        | long polling and renewable visibility lease
+        v
+Independent Python workers
+        |
+        +-- atomic PostgreSQL job claim
+        +-- CPU/memory/GPU admission check
+        +-- workload execution
+        +-- S3 result write
+        +-- atomic completion/failure + lifecycle event
 ```
 
-The API and workers are separate services and can scale independently.
+The API and workers scale independently. PostgreSQL is the source of truth; SQS is an at-least-once delivery mechanism, not the authoritative job-state store.
 
-A job submitted to QueueFlow follows this path:
+## Submission and transactional outbox
+
+`POST /jobs` performs the following work in one PostgreSQL transaction:
+
+1. Lock the authenticated tenant row so concurrent submissions cannot race the quota check.
+2. Count the tenant's active jobs.
+3. Insert the `QUEUED` job.
+4. Insert its `SUBMITTED` lifecycle event.
+5. Insert a unique `job_outbox` record containing the SQS payload.
+6. Commit.
+
+The HTTP request does not call SQS. A background publisher claims pending outbox records using `FOR UPDATE SKIP LOCKED`, sends them, and only then sets `published_at`. Failed sends are logged and retried with bounded exponential backoff.
+
+There is an unavoidable crash window after SQS accepts a message but before `published_at` is recorded. The publisher may send that outbox record again after its lock expires. This is safe because workers use PostgreSQL to claim a job conditionally before executing it.
+
+## Job lifecycle
+
+Typical success:
 
 ```text
-Client
-  ↓
-QueueFlow API
-  ↓
-PostgreSQL + AWS SQS
-  ↓
-Python Worker
-  ↓
-Amazon S3
-  ↓
-Completed Job State
+QUEUED / SUBMITTED
+       |
+       v
+RUNNING / STARTED
+       |
+       v
+COMPLETED / COMPLETED
 ```
 
----
-
-## Features
-
-### Distributed Job Processing
-
-Clients submit jobs through the QueueFlow API.
-
-The API stores durable job state in PostgreSQL and publishes an execution message to AWS SQS.
-
-Independent Python workers continuously poll SQS and process available jobs.
-
-This separates job submission from execution and allows API and worker capacity to scale independently.
-
----
-
-### Durable Job State
-
-PostgreSQL stores persistent information for each job, including:
-
-- job ID
-- tenant
-- job type
-- status
-- progress
-- attempt count
-- maximum attempts
-- CPU requirement
-- memory requirement
-- GPU requirement
-- priority
-- assigned worker
-- creation time
-- start time
-- completion time
-- result
-- error
-- S3 result location
-
----
-
-### Job Lifecycle Events
-
-QueueFlow maintains a persistent event history for every job.
-
-A successful job can follow:
+Retry and terminal failure:
 
 ```text
-SUBMITTED
-    ↓
-STARTED
-    ↓
-COMPLETED
+QUEUED / SUBMITTED
+       |
+       v
+RUNNING / STARTED (attempt 1)
+       |
+       v
+RETRYING / RETRYING
+       |
+       v
+RUNNING / STARTED (attempt 2 or 3)
+       |
+       +--------------------> COMPLETED / COMPLETED
+       |
+       +--------------------> FAILED / FAILED
 ```
 
-A failing job may follow:
+Crash recovery can add a `RECOVERED` event and move a stale worker's `RUNNING` job to `RETRYING`. A queue publication failure does not create `SUBMISSION_FAILED`; the durable outbox stays pending and keeps retrying.
+
+Important state changes pair the job update and lifecycle event in one short database transaction. Workload execution and S3 upload occur outside database transactions.
+
+## Request validation
+
+Job submissions are validated with Zod. Unknown fields and malformed JSON are rejected with HTTP 400 and field-level details.
+
+Accepted values:
+
+- `type`: `text_analysis`, `simulated_compute`, or `always_fail`
+- `text`: required and non-empty for `text_analysis`; maximum 100,000 characters
+- `cpu`: integer from 1 through 128
+- `memoryMb`: integer from 1 through 1,048,576
+- `gpu`: integer from 0 through 64
+- `priority`: integer from 0 through 10
+
+GPU is only an admission/scheduling dimension. QueueFlow does not allocate or execute on real GPUs.
+
+## At-least-once delivery and idempotent claims
+
+SQS Standard can deliver a message more than once. Receiving a message does not authorize execution. A worker first runs a conditional update equivalent to:
+
+```sql
+UPDATE jobs
+SET status = 'RUNNING',
+    attempt_count = attempt_count + 1,
+    worker_id = $worker
+WHERE id = $job
+  AND status IN ('QUEUED', 'RETRYING')
+  AND cpu_required <= $worker_cpu
+  AND memory_required_mb <= $worker_memory
+  AND gpu_required <= $worker_gpu
+RETURNING ...;
+```
+
+Only the worker receiving a row may execute the workload. Messages for completed or missing jobs are acknowledged without execution. Messages for a currently running job are retained temporarily rather than stealing the active claim. Completion and failure updates also require the job to remain `RUNNING` and assigned to that worker, preventing a stale worker from overwriting a recovered job.
+
+## Visibility lease renewal
+
+The worker sets an initial SQS visibility timeout and starts a small lease-renewal thread while handling a message. The thread periodically:
+
+- extends message visibility;
+- refreshes the worker's `BUSY` heartbeat;
+- logs renewal failures without terminating the workload.
+
+The thread is stopped and joined in a `finally` block, so it does not survive the message. This reduces duplicate delivery during long execution, but cannot create an exactly-once guarantee if AWS or the worker is partitioned.
+
+Configure the lease with:
 
 ```text
-SUBMITTED
-    ↓
-STARTED
-    ↓
-RETRYING
-    ↓
-STARTED
-    ↓
-FAILED
+SQS_VISIBILITY_TIMEOUT_SECONDS=120
+SQS_VISIBILITY_RENEWAL_SECONDS=30
 ```
 
-Events can include metadata such as:
+The renewal interval must remain comfortably below the visibility timeout.
 
-- attempt number
-- maximum attempts
-- worker ID
-- requested resources
-- result location
-- failure information
+## Worker crash recovery
 
-Example:
+Each worker registers its capacity and updates `last_heartbeat`. The API runs a periodic recovery scan:
 
-```json
-[
-  {
-    "event_type": "SUBMITTED",
-    "metadata": {
-      "cpu": 1,
-      "memoryMb": 256,
-      "gpu": 0,
-      "priority": 5
-    }
-  },
-  {
-    "event_type": "STARTED",
-    "metadata": {
-      "attempt": 1,
-      "max_attempts": 3,
-      "worker_id": "..."
-    }
-  },
-  {
-    "event_type": "COMPLETED",
-    "metadata": {
-      "attempt": 1,
-      "worker_id": "...",
-      "result_location": "s3://..."
-    }
-  }
-]
-```
+1. Lock workers whose heartbeat is older than `WORKER_STALE_AFTER_SECONDS`.
+2. Mark them `OFFLINE`.
+3. Move their still-assigned `RUNNING` jobs to `RETRYING` and clear the assignment.
+4. Record a `RECOVERED` event in the same transaction.
+5. Allow the original SQS message to become visible after its lease expires.
 
----
+The default stale threshold is 120 seconds. It should be longer than normal heartbeat and lease-renewal intervals. A low value speeds recovery but increases the risk of treating a live worker with temporary database connectivity trouble as dead. The completion guard prevents that stale worker from committing after its claim has been recovered.
 
-### Retry and Failure Handling
+## Retry and DLQ behavior
 
-Workers track execution attempts for every job.
+An attempt is incremented only after a successful atomic claim. Workload errors transition the job to `RETRYING` until `max_attempts` is reached, then to `FAILED`. The message is not deleted on failure.
 
-Jobs contain:
+Retry visibility uses exponential backoff with small jitter:
 
 ```text
-attempt_count
-max_attempts
+RETRY_BASE_DELAY_SECONDS=5
+RETRY_MAX_DELAY_SECONDS=60
 ```
 
-When execution fails, QueueFlow records the error and updates the job state.
+Terraform configures `maxReceiveCount = 3`. After repeated non-acknowledgement, SQS moves the message to the DLQ. The database attempt limit and SQS redrive count are both three and should be changed together. Malformed messages are retained and eventually reach the DLQ instead of creating an infinite loop.
 
-AWS SQS redelivery is used to retry failed messages.
+## Resource-aware dispatch
 
----
+The implementation deliberately keeps one SQS queue. Before publishing an outbox record, the lightweight dispatcher checks that at least one recently healthy worker advertises enough CPU, memory, and modeled GPU capacity. Unschedulable work remains durably `QUEUED` in PostgreSQL instead of immediately bouncing through SQS.
 
-### Dead-Letter Queue
+The worker repeats the capacity check atomically while claiming. A mismatch is not counted as a job attempt and receives a longer visibility delay.
 
-QueueFlow uses an AWS SQS dead-letter queue.
+This is smaller and easier to explain than a queue per hardware shape, but it cannot route a message to a particular suitable worker. In a highly heterogeneous pool, separate resource-class queues or a dedicated scheduler would be more appropriate.
 
-The main SQS queue is configured with a redrive policy and a maximum receive count.
+## Priority behavior
 
-Messages that repeatedly fail are moved to the dead-letter queue instead of being retried forever.
+Priority is an integer from 0 through 10. The outbox dispatcher chooses eligible unpublished jobs by priority, then adds an age boost so old low-priority work eventually competes with newer high-priority work. `PRIORITY_AGING_SECONDS` controls how quickly the boost grows.
 
-This provides a separate location for inspecting jobs that could not be successfully processed.
+This provides priority-aware dispatch, not strict priority execution. Once messages enter an SQS Standard queue, AWS does not guarantee their order. Strict priority would require a different queueing topology or a scheduler that assigns work directly.
 
----
+## Supported workloads
 
-### Worker Registry
+### `text_analysis`
 
-Workers register themselves in PostgreSQL when they start.
+Returns word count, character count, sentence count, and the five most common words.
 
-Each worker tracks:
+### `simulated_compute`
 
-- worker ID
-- worker name
-- status
-- CPU capacity
-- memory capacity
-- GPU capacity
-- current job
-- last heartbeat
-- creation time
+Runs for roughly ten seconds and persists progress at 10, 25, 50, 75, 90, and 100 percent.
 
-Each Kubernetes worker replica receives a unique worker ID.
+### `always_fail`
 
----
+Raises an intentional exception for exercising retries, failure events, and DLQ behavior.
 
-### Worker Heartbeats
+## REST API
 
-Workers periodically update their heartbeat in PostgreSQL.
-
-The API can use heartbeat timestamps to determine whether registered workers are currently healthy.
-
-Workers transition between states such as:
-
-```text
-IDLE
-BUSY
-OFFLINE
-```
-
----
-
-### Resource-Aware Worker Admission
-
-Jobs can declare compute requirements when submitted.
-
-Example:
-
-```json
-{
-  "cpu": 1,
-  "memoryMb": 256,
-  "gpu": 0
-}
-```
-
-Workers also advertise their own capacity.
-
-Example:
-
-```text
-CPU:     4
-Memory:  8192 MB
-GPU:     0
-```
-
-Before executing a job, a worker compares the job requirements against its configured capacity.
-
-If the worker cannot satisfy the request, it does not execute the workload.
-
-GPU capacity is currently modeled for scheduling/admission testing. QueueFlow does not currently execute real GPU workloads.
-
----
-
-### API-Key Authentication
-
-Protected QueueFlow endpoints require an API key.
-
-Example:
-
-```http
-x-api-key: queueflow-demo-key
-```
-
-API keys are associated with tenants in PostgreSQL.
-
----
-
-### Tenant Isolation
-
-Every job belongs to a tenant.
-
-Authenticated requests only return jobs belonging to the tenant associated with the supplied API key.
-
-This prevents one tenant from reading another tenant's jobs.
-
----
-
-### Active Job Quotas
-
-Each tenant has a configurable maximum number of active jobs.
-
-Before accepting another job, QueueFlow counts the tenant's jobs currently in active states such as:
-
-```text
-QUEUED
-RUNNING
-RETRYING
-```
-
-If the quota has been reached, the API rejects the submission.
-
----
-
-### Amazon S3 Result Storage
-
-Completed job results are persisted to Amazon S3.
-
-Results use a structure such as:
-
-```text
-s3://<bucket>/jobs/<job-id>/result.json
-```
-
-The corresponding S3 URI is stored with the PostgreSQL job record.
-
-Example:
-
-```text
-s3://queueflow-results-819379976838-us-east-1/jobs/6c6609cb-9dcc-40c5-8766-ed7000a8c98a/result.json
-```
-
----
-
-### Docker
-
-The API and worker are independently containerized.
-
-```text
-queueflow-api
-queueflow-worker
-```
-
-Docker Compose can be used to run the local development stack.
-
----
-
-### Kubernetes
-
-QueueFlow can run the API and workers as replicated Kubernetes deployments.
-
-The current local development configuration runs:
-
-```text
-2 API replicas
-2 worker replicas
-```
-
-The API is exposed internally through a Kubernetes Service.
-
-Readiness probes are used to verify API health before Kubernetes sends traffic to a pod.
-
----
-
-### Terraform
-
-QueueFlow infrastructure is codified with Terraform.
-
-Terraform configuration currently manages:
-
-- AWS SQS job queue
-- AWS SQS dead-letter queue
-- SQS redrive policy
-- Amazon S3 results bucket
-
-Existing AWS resources were imported into Terraform state so that their configuration can be managed declaratively.
-
----
-
-### Python SDK
-
-QueueFlow includes a lightweight Python SDK for:
-
-- job submission
-- job lookup
-- event lookup
-- polling until completion
-
-Example:
-
-```python
-from queueflow import QueueFlowClient
-
-client = QueueFlowClient(
-    base_url="http://localhost:3001",
-    api_key="queueflow-demo-key"
-)
-
-job = client.submit(
-    job_type="text_analysis",
-    text="QueueFlow SDK submission works"
-)
-
-print("Submitted:", job["id"])
-
-completed = client.wait(job["id"])
-
-print("Status:", completed["status"])
-print("Result:", completed["result"])
-print("S3:", completed["result_location"])
-```
-
-Example output:
-
-```text
-Submitted: 4f96c3a0-bb28-4d3e-89bf-bbff6689712d
-Status: COMPLETED
-Result: {
-    'top_words': [
-        ['queueflow', 1],
-        ['sdk', 1],
-        ['submission', 1],
-        ['works', 1]
-    ],
-    'word_count': 4,
-    'sentence_count': 1,
-    'character_count': 31
-}
-S3: s3://queueflow-results-819379976838-us-east-1/jobs/4f96c3a0-bb28-4d3e-89bf-bbff6689712d/result.json
-```
-
----
-
-### Continuous Integration
-
-QueueFlow uses GitHub Actions for CI.
-
-On pushes to `main` and pull requests, GitHub Actions runs two jobs.
-
-#### API
-
-```text
-Install Node.js dependencies
-↓
-Compile TypeScript
-```
-
-#### Worker
-
-```text
-Install Python dependencies
-↓
-Compile-check worker.py
-```
-
-Both the API and worker CI jobs have been validated successfully.
-
----
-
-## Tech Stack
-
-### Control Plane
-
-- TypeScript
-- Node.js
-- Express
-
-### Workers
-
-- Python
-- boto3
-- psycopg2
-
-### Database
-
-- PostgreSQL
-
-### AWS
-
-- Amazon SQS
-- Amazon S3
-
-### Infrastructure
-
-- Docker
-- Docker Compose
-- Kubernetes
-- Terraform
-
-### Developer Tooling
-
-- GitHub Actions
-- AWS CLI
-- kubectl
-
-### Client
-
-- REST API
-- Python SDK
-
----
-
-## Project Structure
-
-```text
-QueueFlow/
-│
-├── apps/
-│   └── api/
-│       ├── src/
-│       │   ├── index.ts
-│       │   ├── db.ts
-│       │   └── sqs.ts
-│       ├── Dockerfile
-│       ├── package.json
-│       ├── package-lock.json
-│       └── tsconfig.json
-│
-├── workers/
-│   └── processor/
-│       ├── worker.py
-│       ├── requirements.txt
-│       └── Dockerfile
-│
-├── sdk/
-│   └── python/
-│       ├── queueflow.py
-│       └── example.py
-│
-├── infra/
-│   └── terraform/
-│       ├── main.tf
-│       └── .terraform.lock.hcl
-│
-├── k8s/
-│   └── queueflow.yaml
-│
-├── .github/
-│   └── workflows/
-│       └── ci.yml
-│
-├── docker-compose.yml
-├── .gitignore
-└── README.md
-```
-
----
-
-# Supported Job Types
-
-QueueFlow currently includes several workloads for testing the distributed execution platform.
-
-## Text Analysis
-
-Analyzes a text payload and returns basic statistics.
-
-Example request:
-
-```json
-{
-  "type": "text_analysis",
-  "text": "QueueFlow Kubernetes end to end test."
-}
-```
-
-Example result:
-
-```json
-{
-  "top_words": [
-    ["end", 2],
-    ["queueflow", 1],
-    ["kubernetes", 1],
-    ["to", 1],
-    ["test", 1]
-  ],
-  "word_count": 6,
-  "sentence_count": 1,
-  "character_count": 37
-}
-```
-
----
-
-## Simulated Compute
-
-Runs a longer simulated workload and updates job progress over time.
-
-Example progression:
-
-```text
-10%
-25%
-50%
-75%
-90%
-100%
-```
-
-This workload is useful for testing:
-
-- asynchronous execution
-- progress updates
-- longer-running jobs
-- worker state transitions
-
----
-
-## Intentional Failure
-
-The `always_fail` job intentionally throws an exception.
-
-It is used to test:
-
-- retries
-- attempt tracking
-- error persistence
-- lifecycle events
-- SQS redelivery
-- dead-letter queue behavior
-
----
-
-# REST API
-
-## Health Check
+All `/jobs` and `/workers` routes require `x-api-key`. `/health` and `/metrics` are unauthenticated operational endpoints.
 
 ```bash
 curl http://localhost:3001/health
 ```
 
-Example response:
-
-```json
-{
-  "status": "ok",
-  "database": "connected"
-}
-```
-
----
-
-## Submit a Job
-
 ```bash
 curl -X POST http://localhost:3001/jobs \
-  -H "Content-Type: application/json" \
-  -H "x-api-key: queueflow-demo-key" \
+  -H 'Content-Type: application/json' \
+  -H 'x-api-key: queueflow-demo-key' \
   -d '{
     "type": "text_analysis",
-    "text": "QueueFlow distributed execution test.",
+    "text": "QueueFlow validates and dispatches durable work.",
     "cpu": 1,
     "memoryMb": 256,
     "gpu": 0,
@@ -658,402 +215,218 @@ curl -X POST http://localhost:3001/jobs \
   }'
 ```
 
-Example response:
-
-```json
-{
-  "id": "6c6609cb-9dcc-40c5-8766-ed7000a8c98a",
-  "type": "text_analysis",
-  "status": "QUEUED",
-  "progress": 0,
-  "attempt_count": 0,
-  "max_attempts": 3,
-  "cpu_required": 1,
-  "memory_required_mb": 256,
-  "gpu_required": 0,
-  "priority": 5
-}
+```bash
+curl http://localhost:3001/jobs -H 'x-api-key: queueflow-demo-key'
+curl http://localhost:3001/jobs/JOB_ID -H 'x-api-key: queueflow-demo-key'
+curl http://localhost:3001/jobs/JOB_ID/events -H 'x-api-key: queueflow-demo-key'
+curl http://localhost:3001/workers -H 'x-api-key: queueflow-demo-key'
+curl http://localhost:3001/metrics
 ```
 
----
+Authentication is tenant-scoped: job list, detail, and event queries always include the authenticated tenant ID. Worker capacity is currently cluster-wide.
 
-## Get Job
+## Database migrations
+
+SQL migrations live in `apps/api/migrations`. The API acquires a PostgreSQL advisory lock and applies unapplied files at startup. Applied filenames are stored in `schema_migrations`, making concurrent API replica startup safe.
+
+Run migrations manually with:
 
 ```bash
-curl http://localhost:3001/jobs/<job-id> \
-  -H "x-api-key: queueflow-demo-key"
+cd apps/api
+DATABASE_URL=postgresql://queueflow:queueflow@localhost:5433/queueflow npm run migrate
 ```
 
-Example completed job:
+Docker Compose sets `SEED_DEMO_TENANT=true`, which adds the local `queueflow-demo-key` tenant after migration. The migration itself contains no fixed credential, and Kubernetes does not enable this option. Production tenants and keys should be provisioned through a controlled administrative process.
 
-```json
-{
-  "id": "6c6609cb-9dcc-40c5-8766-ed7000a8c98a",
-  "type": "text_analysis",
-  "status": "COMPLETED",
-  "progress": 100,
-  "attempt_count": 1,
-  "max_attempts": 3,
-  "worker_id": "8c38e14a-dab9-4951-bf24-c0db385e2161",
-  "result_location": "s3://queueflow-results-819379976838-us-east-1/jobs/6c6609cb-9dcc-40c5-8766-ed7000a8c98a/result.json"
-}
-```
+## Local macOS setup
 
----
-
-## Get Job Events
-
-```bash
-curl http://localhost:3001/jobs/<job-id>/events \
-  -H "x-api-key: queueflow-demo-key"
-```
-
----
-
-## List Jobs
-
-```bash
-curl http://localhost:3001/jobs \
-  -H "x-api-key: queueflow-demo-key"
-```
-
----
-
-## List Workers
-
-```bash
-curl http://localhost:3001/workers \
-  -H "x-api-key: queueflow-demo-key"
-```
-
-This endpoint exposes registered workers and their health/capacity information.
-
----
-
-# Running QueueFlow Locally
-
-## Prerequisites
-
-Install:
+Prerequisites:
 
 - Docker Desktop
 - Node.js 22+
 - Python 3.11+
-- AWS CLI
-- Terraform
-- kubectl
+- AWS CLI with access to the configured SQS queue and S3 bucket
+- Terraform when provisioning AWS resources
 
-You also need an AWS account with access to SQS and S3.
-
----
-
-## AWS Authentication
-
-Configure the AWS CLI:
+Create local configuration:
 
 ```bash
-aws configure
+cp .env.example .env
 ```
 
-Verify authentication:
+Replace `SQS_QUEUE_URL` and `S3_RESULTS_BUCKET` in `.env`, then verify AWS authentication:
 
 ```bash
 aws sts get-caller-identity
 ```
 
-Never commit AWS credentials to the repository.
-
----
-
-## Environment Variables
-
-The services use configuration such as:
-
-```text
-DATABASE_URL
-AWS_REGION
-SQS_QUEUE_URL
-S3_RESULTS_BUCKET
-```
-
-Worker-specific variables include:
-
-```text
-WORKER_NAME
-WORKER_CPU_CAPACITY
-WORKER_MEMORY_MB
-WORKER_GPU_CAPACITY
-```
-
-Local secrets should be stored outside Git.
-
----
-
-# Docker Compose
-
-Start the local stack:
+Start the complete stack:
 
 ```bash
-docker compose up --build
+docker compose up --build -d
+docker compose ps
+docker compose logs -f api worker postgres
 ```
 
-The API will be available at:
+The API automatically migrates PostgreSQL before becoming healthy. Open the dashboard at `http://localhost:4173`, select Live API, use `/api`, and use `queueflow-demo-key`. The API is at `http://localhost:3001`.
 
-```text
-http://localhost:3001
-```
-
-Check health:
+Stop without deleting PostgreSQL data:
 
 ```bash
-curl http://localhost:3001/health
+docker compose down
 ```
 
----
+Do not add `-v` unless you intend to delete the database volume.
 
-# Kubernetes
+## Terraform
 
-QueueFlow has also been tested locally on Kubernetes using Docker Desktop.
+Terraform provisions:
 
-Build the images:
+- encrypted SQS job and dead-letter queues;
+- a three-receive redrive policy and explicit DLQ allow policy;
+- a private, encrypted, versioned S3 results bucket.
+
+Configure and apply:
 
 ```bash
-docker build -t queueflow-api:local apps/api
+cd infra/terraform
+cp terraform.tfvars.example terraform.tfvars
+# Set a globally unique results_bucket_name.
+terraform init
+terraform plan
+terraform apply
 ```
+
+Copy the output queue URL and bucket name into the root `.env`. Terraform state can contain sensitive infrastructure data and must remain outside version control.
+
+## Kubernetes
+
+The checked-in deployment contains no database password, AWS access key, or developer-specific host path. Create the non-secret configuration from the template:
 
 ```bash
-docker build -t queueflow-worker:local workers/processor
+cp k8s/config.example.yaml /tmp/queueflow-config.yaml
+# Replace the queue URL and bucket name.
+kubectl apply -f /tmp/queueflow-config.yaml
 ```
 
-Apply the Kubernetes resources:
+Create the database secret without committing it:
+
+```bash
+kubectl create secret generic queueflow-secrets \
+  --from-literal=DATABASE_URL='postgresql://USER:PASSWORD@HOST:5432/queueflow'
+```
+
+Then deploy:
 
 ```bash
 kubectl apply -f k8s/queueflow.yaml
 ```
 
-Check the deployments:
+The pods use the `queueflow` Kubernetes service account and the AWS SDK default credential chain. On production Kubernetes, associate that service account with workload identity such as EKS Pod Identity or IRSA. Do not mount a developer's `~/.aws` directory into production pods.
+
+## Graceful shutdown
+
+Workers handle SIGTERM and SIGINT by stopping new polls, allowing the current message handler to finish when the platform grace period permits, stopping its visibility-renewal thread, marking the worker offline, and exiting. Docker Compose and Kubernetes both provide a 60-second termination grace period, which is longer than the 20-second SQS long poll. If a workload cannot finish before forced termination, its SQS lease expires and stale-worker recovery makes the database job retryable.
+
+## Observability
+
+The API and worker emit newline-delimited JSON logs with fields such as `job_id`, `worker_id`, `attempt`, transition status, retry delay, outbox ID, and error. Logs intentionally go to stdout/stderr for collection by Docker or Kubernetes.
+
+`GET /metrics` exposes Prometheus text metrics for current job counts by status, active workers, submissions observed by that API process, outbox failures, scan failures, and recoveries. In-memory counters are per API replica and reset at restart; durable job/worker gauges come from PostgreSQL.
+
+## Tests and CI
+
+Run API checks:
 
 ```bash
-kubectl get pods
+cd apps/api
+npm ci
+npm run build
+npm test
 ```
 
-A healthy local deployment should show two API replicas and two worker replicas:
+Set `TEST_DATABASE_URL` to enable the PostgreSQL integration test. Without it, that one test is explicitly skipped.
 
-```text
-queueflow-api-...       1/1   Running
-queueflow-api-...       1/1   Running
-queueflow-worker-...    1/1   Running
-queueflow-worker-...    1/1   Running
-```
-
-Forward the API service to the local machine:
+Run worker checks:
 
 ```bash
-kubectl port-forward service/queueflow-api 3002:3001
+cd workers/processor
+python3 -m venv .venv
+.venv/bin/pip install -r requirements-dev.txt
+.venv/bin/ruff check worker.py tests
+.venv/bin/python -m py_compile worker.py
+.venv/bin/python -m unittest discover -s tests -v
 ```
 
-Then verify:
+GitHub Actions starts PostgreSQL, applies migrations, builds and tests the TypeScript backend, then lints, compiles, and tests the Python worker. AWS clients are mocked in tests, and CI does not require AWS credentials.
 
-```bash
-curl http://localhost:3002/health
-```
+## Environment variables
 
----
-
-## Kubernetes and AWS Credentials
-
-The current Kubernetes setup is designed for local development.
-
-For local testing, AWS credentials can be made available to the API and worker containers from the developer environment.
-
-Production deployments should **not** use developer credentials.
-
-A production deployment should use workload-based AWS authentication such as:
-
-- IAM roles
-- service accounts
-- EKS Pod Identity
-- IRSA
-
-depending on the deployment environment.
-
----
-
-# Terraform
-
-Terraform files are located in:
+API:
 
 ```text
-infra/terraform/
+DATABASE_URL                         required
+PORT                                 default 3001
+CORS_ORIGIN                          optional comma-separated allowlist
+AWS_REGION                           default us-east-1
+SQS_QUEUE_URL                        required for publication
+OUTBOX_POLL_INTERVAL_MS              default 1000
+OUTBOX_LOCK_TIMEOUT_SECONDS          default 30
+OUTBOX_RETRY_BASE_MS                 default 1000
+OUTBOX_RETRY_MAX_MS                  default 60000
+WORKER_STALE_AFTER_SECONDS           default 120
+WORKER_RECOVERY_INTERVAL_MS          default 30000
+PRIORITY_AGING_SECONDS               default 60
+SEED_DEMO_TENANT                     default false; local development only
 ```
 
-Initialize Terraform:
-
-```bash
-cd infra/terraform
-terraform init
-```
-
-Preview infrastructure changes:
-
-```bash
-terraform plan
-```
-
-Existing QueueFlow AWS resources have been imported into Terraform state so that their infrastructure configuration can be maintained declaratively.
-
-Terraform state files and downloaded providers are intentionally excluded from Git.
-
----
-
-# End-to-End Validation
-
-QueueFlow has been validated through the complete execution path.
-
-A Kubernetes API request was submitted with:
-
-```json
-{
-  "type": "text_analysis",
-  "text": "QueueFlow Kubernetes end to end test.",
-  "cpu": 1,
-  "memoryMb": 256,
-  "gpu": 0,
-  "priority": 5
-}
-```
-
-The API initially returned:
+Worker:
 
 ```text
-status: QUEUED
+DATABASE_URL                         required
+AWS_REGION                           default us-east-1
+SQS_QUEUE_URL                        required
+S3_RESULTS_BUCKET                    optional; results remain in PostgreSQL if unset
+WORKER_ID                            generated at startup when unset
+WORKER_NAME                          default queueflow-worker
+WORKER_CPU_CAPACITY                  default 4
+WORKER_MEMORY_MB                     default 8192
+WORKER_GPU_CAPACITY                  default 0
+SQS_VISIBILITY_TIMEOUT_SECONDS       default 120
+SQS_VISIBILITY_RENEWAL_SECONDS       default 30
+RETRY_BASE_DELAY_SECONDS             default 5
+RETRY_MAX_DELAY_SECONDS              default 60
+RESOURCE_MISMATCH_DELAY_SECONDS      default 30
 ```
 
-A Python worker then consumed the message and the job reached:
+## Repository layout
 
 ```text
-status: COMPLETED
-progress: 100
-attempt_count: 1
+apps/api/                    Express API, outbox publisher, recovery, migrations, tests
+apps/web/                    Optional React dashboard
+workers/processor/           Python worker and tests
+sdk/python/                  Lightweight Python client
+infra/terraform/             SQS, DLQ, and S3 infrastructure
+k8s/                        Kubernetes deployments and config template
+docker-compose.yml           Local PostgreSQL/API/worker/web stack
+.github/workflows/ci.yml     Backend and worker CI
 ```
 
-The job contained an assigned worker ID and an S3 result location.
+## Known limitations
 
-Lifecycle history recorded:
+- QueueFlow does not execute real GPU workloads. GPU is only an integer capacity requirement.
+- This is not a replacement for Slurm, Ray, Kubernetes Kueue, or a production workflow engine.
+- The scheduler is an intentionally lightweight outbox dispatcher. SQS Standard prevents strict priority ordering and targeted worker assignment.
+- Capability gating only proves that a suitable healthy worker existed at dispatch time. Another unsuitable worker can still receive the message.
+- PostgreSQL and SQS together do not provide exactly-once execution. Correctness depends on conditional claims and idempotent state transitions; arbitrary external workload side effects are not automatically idempotent.
+- Recovery uses heartbeat age as evidence of failure. Network partitions force a tradeoff between recovery speed and false positives.
+- Results are written to S3 before the completion transaction. A crash in between can leave an object for a job that later retries; the deterministic key makes later writes replace the logical result.
+- The outbox and recovery loops run inside every API replica. Database row locks make this safe, but a dedicated control-plane process would be easier to scale and observe at high throughput.
+- API keys are stored directly in the current schema. Production systems should store hashed credentials, support rotation, and add rate limiting and audit logs.
+- `/metrics` is unauthenticated and should be restricted by network policy or a private service in production.
+- Local Docker/Kubernetes testing is not equivalent to operating a production Kubernetes cluster. The manifests omit ingress, network policies, pod disruption budgets, autoscaling, managed PostgreSQL, backups, and full monitoring.
+- Automated tests mock AWS behavior. A separate, credentialed staging environment is still needed to validate real SQS visibility, redrive, IAM, and S3 behavior.
 
-```text
-SUBMITTED
-STARTED
-COMPLETED
-```
+## Toward heterogeneous GPU/HPC workloads
 
-The final result was successfully persisted to Amazon S3.
-
-This validated:
-
-```text
-Authenticated Client
-        ↓
-Kubernetes API
-        ↓
-PostgreSQL
-        ↓
-AWS SQS
-        ↓
-Python Worker
-        ↓
-Amazon S3
-        ↓
-Persistent Job + Event State
-```
-
----
-
-# Current Limitations
-
-QueueFlow is currently a portfolio-scale distributed systems implementation rather than a production scheduler.
-
-Current limitations include:
-
-- GPU capacity is modeled but real GPU execution is not implemented
-- workers use resource-aware admission rather than a centralized heterogeneous scheduler
-- job priority is stored but AWS SQS Standard queues do not guarantee priority ordering
-- PostgreSQL currently runs outside the Kubernetes cluster in the local development setup
-- Kubernetes AWS authentication is currently configured for local development rather than production workload identity
-- the Python SDK is local to the repository and is not currently published to PyPI
-
-These are potential areas for future development.
-
----
-
-# Roadmap
-
-Planned improvements include:
-
-- [ ] Web dashboard for jobs, workers, events, and system health
-- [ ] Live job progress visualization
-- [ ] Worker capacity dashboard
-- [ ] Retry and failure inspection UI
-- [ ] Dead-letter queue visibility
-- [ ] Centralized resource-aware scheduling
-- [ ] Priority-aware queueing
-- [ ] Real GPU worker support
-- [ ] Prometheus metrics
-- [ ] Grafana dashboards
-- [ ] Distributed tracing
-- [ ] Structured logging
-- [ ] Rate limiting
-- [ ] Improved tenant management
-- [ ] PostgreSQL deployment inside Kubernetes
-- [ ] Production AWS workload identity
-- [ ] Helm chart
-- [ ] Python package publishing
-- [ ] Automated integration tests
-
----
-
-# Why QueueFlow?
-
-QueueFlow was built to explore the infrastructure behind distributed compute platforms:
-
-- How should applications submit long-running work without blocking an API request?
-- How can workers execute jobs independently?
-- How should job state survive process restarts?
-- What happens when a worker fails?
-- How can failed jobs be retried safely?
-- How can repeatedly failing work be isolated?
-- How can worker capacity and health be tracked?
-- How can results be stored independently of the worker that produced them?
-- How can the same services be containerized and replicated?
-
-The project focuses on the systems surrounding compute workloads rather than the workload itself.
-
----
-
-# Status
-
-The QueueFlow backend and distributed execution infrastructure are functional.
-
-Validated components include:
-
-- TypeScript/Express API
-- Python workers
-- PostgreSQL job state
-- AWS SQS job delivery
-- AWS SQS dead-letter queue
-- Amazon S3 result storage
-- retry/failure handling
-- lifecycle event logging
-- worker registration
-- worker heartbeats
-- resource-aware admission
-- API-key authentication
-- tenant isolation
-- tenant quotas
-- Docker
-- Kubernetes replicas
-- Terraform infrastructure management
-- Python SDK
-- GitHub Actions CI
-
-A web frontend/dashboard is planned next.
+A serious heterogeneous platform would need resource-class or per-capability queues, a centralized scheduler with reservations and fairness, real GPU discovery and device allocation, topology awareness, preemption, gang scheduling, workload isolation, artifact staging, cancellation, idempotent user workloads, admission control, autoscaling, durable scheduler leadership, richer metrics/tracing, and production workload identity. QueueFlow models the surrounding ideas without claiming to implement those systems.

@@ -27,3 +27,6 @@ __pycache__/
 *.tfstate.*
 crash.log
 crash.*.log
+
+# Generated document QA intermediates
+/tmp/
