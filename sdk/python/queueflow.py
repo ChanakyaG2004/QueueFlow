@@ -64,6 +64,26 @@ class QueueFlowClient:
         response.raise_for_status()
         return response.json()
 
+    def list_jobs(self):
+        """Return jobs visible to the authenticated tenant."""
+        response = requests.get(
+            f"{self.base_url}/jobs",
+            headers=self.headers,
+            timeout=10
+        )
+        response.raise_for_status()
+        return response.json()
+
+    def list_workers(self):
+        """Return registered workers and their health/capacity information."""
+        response = requests.get(
+            f"{self.base_url}/workers",
+            headers=self.headers,
+            timeout=10
+        )
+        response.raise_for_status()
+        return response.json()
+
     def wait(self, job_id, interval=1):
         while True:
             job = self.get(job_id)
