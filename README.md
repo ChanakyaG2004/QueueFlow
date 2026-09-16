@@ -1,6 +1,6 @@
 # QueueFlow
 
-QueueFlow is a portfolio-scale distributed job execution platform. It accepts asynchronous work through a TypeScript/Express API, stores authoritative state in PostgreSQL, delivers execution messages through AWS SQS, runs work on independent Python workers, and stores results in Amazon S3.
+QueueFlow is a portfolio-scale distributed job execution platform. It accepts asynchronous work through a TypeScript/Express API, stores authoritative state in PostgreSQL, delivers execution messages through AWS SQS, executes jobs on independent Python workers, and stores results in Amazon S3.
 
 The project demonstrates durable state, tenant isolation, quotas, transactional messaging, at-least-once delivery, idempotent job claiming, retries, dead-letter handling, worker leases and recovery, lightweight resource admission, and priority-aware dispatch.
 
