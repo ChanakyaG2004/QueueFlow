@@ -52,7 +52,7 @@ There is an unavoidable crash window after SQS accepts a message but before `pub
 
 ## Job lifecycle
 
-Typical success:
+Typical successful job lifecycle:
 
 ```text
 QUEUED / SUBMITTED
@@ -152,7 +152,7 @@ Each worker registers its capacity and updates `last_heartbeat`. The API runs a 
 
 The default stale threshold is 120 seconds. It should be longer than normal heartbeat and lease-renewal intervals. A low value speeds recovery but increases the risk of treating a live worker with temporary database connectivity trouble as dead. The completion guard prevents that stale worker from committing after its claim has been recovered.
 
-## Retry and DLQ behavior
+## Retry and dead-letter queue (DLQ) behavior
 
 An attempt is incremented only after a successful atomic claim. Workload errors transition the job to `RETRYING` until `max_attempts` is reached, then to `FAILED`. The message is not deleted on failure.
 
